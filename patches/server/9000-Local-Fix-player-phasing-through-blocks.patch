@@ -1,0 +1,250 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: stephanofer <slowdown_4@hotmail.com>
+Date: Fri, 18 Sep 2026 19:05:05 -0500
+Subject: [PATCH] fix: prevent players from phasing through blocks
+
+
+diff --git a/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotWorldConfig.java b/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotWorldConfig.java
+index fc00a5f67c5a6b2642c23834da1bef31338e2f07..b4cf50b261f7805dd3f698c457982956af07bcdf 100644
+--- a/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotWorldConfig.java
++++ b/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotWorldConfig.java
+@@ -70,4 +70,18 @@ public class PandaSpigotWorldConfig {
+         "behaviour while still providing performance optimizations.\n" +
+         "Default: false")
+     public boolean useSpigotChunkTickingSelection = false;
++
++    @Comment("Protects players from crossing solid block collision boxes between movement packets.\n" +
++        "It also resynchronizes both halves of cancelled door breaks and limits repeated\n" +
++        "block-break attempts in a single tick. Disable this option to restore vanilla behavior.")
++    public PhaseProtectionConfig phaseProtection = new PhaseProtectionConfig();
++
++    @ConfigSerializable
++    public static class PhaseProtectionConfig {
++        public boolean enabled = true;
++
++        @Comment("Maximum block-break attempts accepted from a survival/adventure player in one tick.\n" +
++            "Set to 0 or a negative value to disable only this limit.")
++        public int maxBlockBreaksPerTick = 2;
++    }
+ }
+diff --git a/src/main/java/net/minecraft/server/Block.java b/src/main/java/net/minecraft/server/Block.java
+index a784e04a09ffac4d09415353084aea3fd5451d9c..3de63c030021bdbf02f332d9f0888aa3a9a83c62 100644
+--- a/src/main/java/net/minecraft/server/Block.java
++++ b/src/main/java/net/minecraft/server/Block.java
+@@ -490,6 +490,30 @@ public class Block {
+         }
+     }
+ 
++    // PandaSpigot start - Prevent players from phasing through block collision boxes
++    public MovingObjectPosition rayTracePlayerCollision(World world, BlockPosition blockposition, IBlockData iblockdata, Vec3D start, Vec3D end, EntityPlayer player) {
++        List<AxisAlignedBB> collisionBoxes = new java.util.ArrayList<AxisAlignedBB>();
++        this.a(world, blockposition, iblockdata, new AxisAlignedBB(Double.NEGATIVE_INFINITY, Double.NEGATIVE_INFINITY, Double.NEGATIVE_INFINITY, Double.POSITIVE_INFINITY, Double.POSITIVE_INFINITY, Double.POSITIVE_INFINITY), collisionBoxes, player);
++        MovingObjectPosition nearest = null;
++        double nearestDistance = Double.POSITIVE_INFINITY;
++
++        for (AxisAlignedBB collisionBox : collisionBoxes) {
++            MovingObjectPosition collision = collisionBox.a(start, end);
++
++            if (collision != null) {
++                double distance = start.distanceSquared(collision.pos);
++
++                if (distance < nearestDistance) {
++                    nearest = new MovingObjectPosition(collision.pos, collision.direction, blockposition);
++                    nearestDistance = distance;
++                }
++            }
++        }
++
++        return nearest;
++    }
++    // PandaSpigot end
++
+     private boolean a(Vec3D vec3d) {
+         return vec3d == null ? false : vec3d.b >= this.minY && vec3d.b <= this.maxY && vec3d.c >= this.minZ && vec3d.c <= this.maxZ;
+     }
+diff --git a/src/main/java/net/minecraft/server/PlayerConnection.java b/src/main/java/net/minecraft/server/PlayerConnection.java
+index a4c9ee61ca31700b35250cb014f31ffc413cbf8c..56bb352cf45577e7f848151c93d14f013cddf35a 100644
+--- a/src/main/java/net/minecraft/server/PlayerConnection.java
++++ b/src/main/java/net/minecraft/server/PlayerConnection.java
+@@ -453,7 +453,14 @@ public class PlayerConnection implements PacketListenerPlayIn, IUpdatePlayerList
+                     if (!this.player.noclip) {
+                         boolean flag2 = worldserver.getCubes(this.player, this.player.getBoundingBox().shrink((double) f4, (double) f4, (double) f4)).isEmpty();
+ 
+-                        if (flag && (flag1 || !flag2) && !this.player.isSleeping()) {
++                        // PandaSpigot start - Prevent players from phasing between collision checks
++                        MovingObjectPosition phaseCollision = null;
++                        if (worldserver.pandaSpigotConfig.phaseProtection.enabled && flag && flag2 && !this.player.isSleeping() && (this.o != d7 || this.p != d8 || this.q != d9)) {
++                            phaseCollision = worldserver.rayTracePlayerCollision(new Vec3D(this.o, this.p + 0.9D, this.q), new Vec3D(d7, d8 + 0.9D, d9), this.player);
++                        }
++                        // PandaSpigot end
++
++                        if ((phaseCollision != null || flag && (flag1 || !flag2)) && !this.player.isSleeping()) { // PandaSpigot - Phase protection
+                             this.a(this.o, this.p, this.q, f2, f3);
+                             return;
+                         }
+diff --git a/src/main/java/net/minecraft/server/PlayerInteractManager.java b/src/main/java/net/minecraft/server/PlayerInteractManager.java
+index 4a6b183900ff2b17084e45ac54b8b079ab8628cb..17d9b982d21b839c74c349491033a20572760ba4 100644
+--- a/src/main/java/net/minecraft/server/PlayerInteractManager.java
++++ b/src/main/java/net/minecraft/server/PlayerInteractManager.java
+@@ -21,6 +21,10 @@ public class PlayerInteractManager {
+     private BlockPosition i;
+     private int j;
+     private int k;
++    // PandaSpigot start - Phase protection
++    private int lastBlockBreakTick = -1;
++    private int blockBreaksThisTick;
++    // PandaSpigot end
+ 
+     public PlayerInteractManager(World world) {
+         this.gamemode = WorldSettings.EnumGamemode.NOT_SET;
+@@ -107,7 +111,7 @@ public class PlayerInteractManager {
+         PlayerInteractEvent event = CraftEventFactory.callPlayerInteractEvent(this.player, Action.LEFT_CLICK_BLOCK, blockposition, enumdirection, this.player.inventory.getItemInHand());
+         if (event.isCancelled()) {
+             // Let the client know the block still exists
+-            ((EntityPlayer) this.player).playerConnection.sendPacket(new PacketPlayOutBlockChange(this.world, blockposition));
++            this.sendCorrectiveBlockUpdate(blockposition); // PandaSpigot - Phase protection
+             // Update any tile entity data for this block
+             TileEntity tileentity = this.world.getTileEntity(blockposition);
+             if (tileentity != null) {
+@@ -149,12 +153,16 @@ public class PlayerInteractManager {
+             // CraftBukkit start - Swings at air do *NOT* exist.
+             if (event.useInteractedBlock() == Event.Result.DENY) {
+                 // If we denied a door from opening, we need to send a correcting update to the client, as it already opened the door.
+-                IBlockData data = this.world.getType(blockposition);
+-                if (block == Blocks.WOODEN_DOOR) {
++                if (block instanceof BlockDoor) { // PandaSpigot - Phase protection; also correct iron doors
+                     // For some reason *BOTH* the bottom/top part have to be marked updated.
+-                    boolean bottom = data.get(BlockDoor.HALF) == BlockDoor.EnumDoorHalf.LOWER;
+-                    ((EntityPlayer) this.player).playerConnection.sendPacket(new PacketPlayOutBlockChange(this.world, blockposition));
+-                    ((EntityPlayer) this.player).playerConnection.sendPacket(new PacketPlayOutBlockChange(this.world, bottom ? blockposition.up() : blockposition.down()));
++                    if (this.world.pandaSpigotConfig.phaseProtection.enabled) { // PandaSpigot - Phase protection
++                        this.sendCorrectiveBlockUpdate(blockposition); // PandaSpigot - Phase protection
++                    } else if (block == Blocks.WOODEN_DOOR) { // CraftBukkit - preserve vanilla correction when phase protection is disabled
++                        IBlockData data = this.world.getType(blockposition);
++                        boolean bottom = data.get(BlockDoor.HALF) == BlockDoor.EnumDoorHalf.LOWER;
++                        this.player.playerConnection.sendPacket(new PacketPlayOutBlockChange(this.world, blockposition));
++                        this.player.playerConnection.sendPacket(new PacketPlayOutBlockChange(this.world, bottom ? blockposition.up() : blockposition.down()));
++                    }
+                 } else if (block == Blocks.TRAPDOOR) {
+                     ((EntityPlayer) this.player).playerConnection.sendPacket(new PacketPlayOutBlockChange(this.world, blockposition));
+                 }
+@@ -168,7 +176,7 @@ public class PlayerInteractManager {
+             if (event.useItemInHand() == Event.Result.DENY) {
+                 // If we 'insta destroyed' then the client needs to be informed.
+                 if (f > 1.0f) {
+-                    ((EntityPlayer) this.player).playerConnection.sendPacket(new PacketPlayOutBlockChange(this.world, blockposition));
++                    this.sendCorrectiveBlockUpdate(blockposition); // PandaSpigot - Phase protection
+                 }
+                 return;
+             }
+@@ -176,7 +184,7 @@ public class PlayerInteractManager {
+ 
+             if (blockEvent.isCancelled()) {
+                 // Let the client know the block still exists
+-                ((EntityPlayer) this.player).playerConnection.sendPacket(new PacketPlayOutBlockChange(this.world, blockposition));
++                this.sendCorrectiveBlockUpdate(blockposition); // PandaSpigot - Phase protection
+                 return;
+             }
+ 
+@@ -222,7 +230,7 @@ public class PlayerInteractManager {
+             }
+         // CraftBukkit start - Force block reset to client
+         } else {
+-            this.player.playerConnection.sendPacket(new PacketPlayOutBlockChange(this.world, blockposition));
++            this.sendCorrectiveBlockUpdate(blockposition); // PandaSpigot - Phase protection
+             // CraftBukkit end
+         }
+ 
+@@ -246,7 +254,44 @@ public class PlayerInteractManager {
+         return flag;
+     }
+ 
++    // PandaSpigot start - Phase protection
++    private void sendCorrectiveBlockUpdate(BlockPosition blockposition) {
++        IBlockData data = this.world.getType(blockposition);
++        this.player.playerConnection.sendPacket(new PacketPlayOutBlockChange(this.world, blockposition));
++
++        if (this.world.pandaSpigotConfig.phaseProtection.enabled && data.getBlock() instanceof BlockDoor) {
++            boolean bottom = data.get(BlockDoor.HALF) == BlockDoor.EnumDoorHalf.LOWER;
++            BlockPosition otherHalf = bottom ? blockposition.up() : blockposition.down();
++
++            if (this.world.getType(otherHalf).getBlock() == data.getBlock()) {
++                this.player.playerConnection.sendPacket(new PacketPlayOutBlockChange(this.world, otherHalf));
++            }
++        }
++    }
++
++    private boolean checkBlockBreakFrequency(BlockPosition blockposition) {
++        int limit = this.world.pandaSpigotConfig.phaseProtection.maxBlockBreaksPerTick;
++
++        if (!this.world.pandaSpigotConfig.phaseProtection.enabled || limit <= 0 || this.isCreative()) {
++            return true;
++        }
++
++        if (this.lastBlockBreakTick != MinecraftServer.currentTick) {
++            this.lastBlockBreakTick = MinecraftServer.currentTick;
++            this.blockBreaksThisTick = 0;
++        }
++
++        if (++this.blockBreaksThisTick <= limit) {
++            return true;
++        }
++
++        this.sendCorrectiveBlockUpdate(blockposition);
++        return false;
++    }
++    // PandaSpigot end
++
+     public boolean breakBlock(BlockPosition blockposition) {
++        if (!this.checkBlockBreakFrequency(blockposition)) return false; // PandaSpigot - Phase protection
+         // CraftBukkit start - fire BlockBreakEvent
+         BlockBreakEvent event = null;
+ 
+@@ -290,7 +335,7 @@ public class PlayerInteractManager {
+                     return false;
+                 }
+                 // Let the client know the block still exists
+-                ((EntityPlayer) this.player).playerConnection.sendPacket(new PacketPlayOutBlockChange(this.world, blockposition));
++                this.sendCorrectiveBlockUpdate(blockposition); // PandaSpigot - Phase protection
+                 // Update any tile entity data for this block
+                 TileEntity tileentity = this.world.getTileEntity(blockposition);
+                 if (tileentity != null) {
+diff --git a/src/main/java/net/minecraft/server/World.java b/src/main/java/net/minecraft/server/World.java
+index 522c63e7f884a8b2202b111c81df9b54384703d5..d25ff2ef12236ff824a5f85c5032bf256ba099bc 100644
+--- a/src/main/java/net/minecraft/server/World.java
++++ b/src/main/java/net/minecraft/server/World.java
+@@ -892,6 +892,16 @@ public abstract class World implements IBlockAccess {
+     }
+ 
+     public MovingObjectPosition rayTrace(Vec3D vec3d, Vec3D vec3d1, boolean flag, boolean flag1, boolean flag2) {
++        return this.rayTrace(vec3d, vec3d1, flag, flag1, flag2, null); // PandaSpigot - Phase protection
++    }
++
++    // PandaSpigot start - Prevent players from phasing through block collision boxes
++    public MovingObjectPosition rayTracePlayerCollision(Vec3D start, Vec3D end, EntityPlayer player) {
++        return this.rayTrace(start, end, false, true, false, player);
++    }
++
++    private MovingObjectPosition rayTrace(Vec3D vec3d, Vec3D vec3d1, boolean flag, boolean flag1, boolean flag2, EntityPlayer player) {
++    // PandaSpigot end
+         if (!Double.isNaN(vec3d.a) && !Double.isNaN(vec3d.b) && !Double.isNaN(vec3d.c)) {
+             if (!Double.isNaN(vec3d1.a) && !Double.isNaN(vec3d1.b) && !Double.isNaN(vec3d1.c)) {
+                 int i = MathHelper.floor(vec3d1.a);
+@@ -908,7 +918,7 @@ public abstract class World implements IBlockAccess {
+                 Block block = iblockdata.getBlock();
+ 
+                 if ((!flag1 || block.a(this, blockposition, iblockdata) != null) && block.a(iblockdata, flag)) {
+-                    MovingObjectPosition movingobjectposition = block.a(this, blockposition, vec3d, vec3d1);
++                    MovingObjectPosition movingobjectposition = player == null ? block.a(this, blockposition, vec3d, vec3d1) : block.rayTracePlayerCollision(this, blockposition, iblockdata, vec3d, vec3d1, player); // PandaSpigot - Phase protection
+ 
+                     if (movingobjectposition != null) {
+                         return movingobjectposition;
+@@ -1014,7 +1024,7 @@ public abstract class World implements IBlockAccess {
+ 
+                     if (!flag1 || block1.a(this, blockposition, iblockdata1) != null) {
+                         if (block1.a(iblockdata1, flag)) {
+-                            MovingObjectPosition movingobjectposition2 = block1.a(this, blockposition, vec3d, vec3d1);
++                            MovingObjectPosition movingobjectposition2 = player == null ? block1.a(this, blockposition, vec3d, vec3d1) : block1.rayTracePlayerCollision(this, blockposition, iblockdata1, vec3d, vec3d1, player); // PandaSpigot - Phase protection
+ 
+                             if (movingobjectposition2 != null) {
+                                 return movingobjectposition2;
