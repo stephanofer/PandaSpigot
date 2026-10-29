@@ -1,0 +1,277 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: stephanofer <slowdown_4@hotmail.com>
+Date: Sat, 10 Oct 2026 12:00:00 +0000
+Subject: [PATCH] fix: validate movement from inside blocks
+
+Plugin-placed blocks can enclose a player, disabling vanilla movement
+correction and the clear-to-clear phase check. Validate the swept player
+volume against new obstacles and reject deepening existing partial overlaps.
+Allow escape and vanilla axis-ordered step-up movement. Bound exceptional
+scans and refuse unloaded chunks without changing plugin teleports.
+
+diff --git a/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotWorldConfig.java b/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotWorldConfig.java
+--- a/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotWorldConfig.java
++++ b/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotWorldConfig.java
+@@ -65,7 +65,10 @@ public class PandaSpigotWorldConfig {
+             "Default: false")
+     public boolean useSpigotChunkTickingSelection = false;
+ 
+-    @Comment("Protects players from crossing solid block collision boxes between movement packets.\n" +
++    @Comment("Protects players from crossing solid block collision boxes between movement packets,\n" +
++        "including movement starting inside plugin-placed blocks. Existing overlaps allow escape,\n" +
++        "but cannot be deepened, and new obstacles remain solid. Embedded movement is limited to 10 blocks per axis\n" +
++        "per packet and cannot enter unloaded chunks. Plugin teleports are unaffected.\n" +
+         "It also resynchronizes both halves of cancelled door breaks and limits repeated\n" +
+         "block-break attempts in a single tick. Disable this option to restore vanilla behavior.")
+     public PhaseProtectionConfig phaseProtection = new PhaseProtectionConfig();
+diff --git a/src/main/java/net/minecraft/server/PlayerConnection.java b/src/main/java/net/minecraft/server/PlayerConnection.java
+--- a/src/main/java/net/minecraft/server/PlayerConnection.java
++++ b/src/main/java/net/minecraft/server/PlayerConnection.java
+@@ -424,6 +424,17 @@ public class PlayerConnection implements PacketListenerPlayIn, IUpdatePlayerList
+                     float f4 = 0.0625F;
+                     boolean flag = worldserver.getCubes(this.player, this.player.getBoundingBox().shrink((double) f4, (double) f4, (double) f4)).isEmpty();
+ 
++                    // PandaSpigot start - Validate movement out of plugin-placed blocks
++                    boolean embeddedCollision = false;
++                    if (worldserver.pandaSpigotConfig.phaseProtection.enabled && !flag && !this.player.noclip && !this.player.isSleeping()
++                        && (d11 != 0.0D || d12 != 0.0D || d13 != 0.0D)) {
++                        // Use only a numerical tolerance, not the vanilla 1/16-block
++                        // inset: a large inset would allow repeated small penetrations.
++                        AxisAlignedBB start = this.player.getBoundingBox().shrink(1.0E-7D, 1.0E-7D, 1.0E-7D);
++                        embeddedCollision = worldserver.hasNewEmbeddedPlayerCollision(this.player, start, d11, d12, d13);
++                    }
++                    // PandaSpigot end
++
+                     if (this.player.onGround && !packetplayinflying.f() && d12 > 0.0D) {
+                         this.player.bF();
+                     }
+@@ -460,7 +471,7 @@ public class PlayerConnection implements PacketListenerPlayIn, IUpdatePlayerList
+                         }
+                         // PandaSpigot end
+ 
+-                        if ((phaseCollision != null || flag && (flag1 || !flag2)) && !this.player.isSleeping()) { // PandaSpigot - Phase protection
++                        if ((embeddedCollision || phaseCollision != null || flag && (flag1 || !flag2)) && !this.player.isSleeping()) { // PandaSpigot - Phase protection
+                             this.a(this.o, this.p, this.q, f2, f3);
+                             return;
+                         }
+diff --git a/src/main/java/net/minecraft/server/World.java b/src/main/java/net/minecraft/server/World.java
+--- a/src/main/java/net/minecraft/server/World.java
++++ b/src/main/java/net/minecraft/server/World.java
+@@ -900,6 +900,25 @@ public abstract class World implements IBlockAccess {
+         return this.rayTrace(start, end, false, true, false, player);
+     }
+ 
++    public boolean hasNewEmbeddedPlayerCollision(EntityPlayer player, AxisAlignedBB start, double dx, double dy, double dz) {
++        // Bound exceptional collision scans, even with permissive speed thresholds
++        // or large velocities. Plugin teleports do not use this movement path.
++        if (Math.abs(dx) > 10.0D || Math.abs(dy) > 10.0D || Math.abs(dz) > 10.0D) {
++            return true;
++        }
++
++        AxisAlignedBB swept = start.a(dx, dy, dz);
++        for (int x = MathHelper.floor(swept.a) >> 4; x <= MathHelper.floor(swept.d) >> 4; ++x) {
++            for (int z = MathHelper.floor(swept.c) >> 4; z <= MathHelper.floor(swept.f) >> 4; ++z) {
++                if (this.getChunkIfLoaded(x, z) == null) {
++                    return true;
++                }
++            }
++        }
++
++        return com.hpfxd.pandaspigot.util.EmbeddedPlayerCollision.isBlocked(start, dx, dy, dz, this.getCubes(player, swept));
++    }
++
+     private MovingObjectPosition rayTrace(Vec3D vec3d, Vec3D vec3d1, boolean flag, boolean flag1, boolean flag2, EntityPlayer player) {
+     // PandaSpigot end
+         if (!Double.isNaN(vec3d.a) && !Double.isNaN(vec3d.b) && !Double.isNaN(vec3d.c)) {
+diff --git a/src/main/java/com/hpfxd/pandaspigot/util/EmbeddedPlayerCollision.java b/src/main/java/com/hpfxd/pandaspigot/util/EmbeddedPlayerCollision.java
+new file mode 100644
+--- /dev/null
++++ b/src/main/java/com/hpfxd/pandaspigot/util/EmbeddedPlayerCollision.java
+@@ -0,0 +1,87 @@
++package com.hpfxd.pandaspigot.util;
++
++import java.util.List;
++import net.minecraft.server.AxisAlignedBB;
++
++/** Collision validation for players enclosed by blocks placed around them. */
++public final class EmbeddedPlayerCollision {
++    private EmbeddedPlayerCollision() {
++    }
++
++    public static boolean isBlocked(AxisAlignedBB start, double dx, double dy, double dz, List<AxisAlignedBB> collisions) {
++        boolean directBlocked = false;
++        boolean axisBlocked = false;
++        AxisAlignedBB afterY = start.c(0.0D, dy, 0.0D);
++        AxisAlignedBB afterX = afterY.c(dx, 0.0D, 0.0D);
++
++        for (AxisAlignedBB collision : collisions) {
++            // Permit escape, but never turn a shallow existing overlap into a
++            // deeper one. Otherwise a player could use the vanilla collision
++            // inset next to a wall before being enclosed by a plugin.
++            if (collision.b(start)) {
++                if (deepensOverlap(start.a, start.d, dx, collision.a, collision.d)
++                    || deepensOverlap(start.b, start.e, dy, collision.b, collision.e)
++                    || deepensOverlap(start.c, start.f, dz, collision.c, collision.f)) {
++                    return true;
++                }
++                continue;
++            }
++
++            directBlocked |= intersects(start, dx, dy, dz, collision);
++            // Minecraft resolves movement vertically, then along X and Z. This
++            // alternative permits stepping up and sliding around block corners.
++            axisBlocked |= intersects(start, 0.0D, dy, 0.0D, collision)
++                || intersects(afterY, dx, 0.0D, 0.0D, collision)
++                || intersects(afterX, 0.0D, 0.0D, dz, collision);
++
++            if (directBlocked && axisBlocked) {
++                return true;
++            }
++        }
++
++        return false;
++    }
++
++    private static boolean deepensOverlap(double min, double max, double delta, double obstacleMin, double obstacleMax) {
++        // A partial overlap may shrink or slide, but cannot increase, even if
++        // a large packet would end completely beyond the obstacle.
++        return delta > 1.0E-9D && min < obstacleMin && max < obstacleMax
++            || delta < -1.0E-9D && min > obstacleMin && max > obstacleMax;
++    }
++
++    private static boolean intersects(AxisAlignedBB start, double dx, double dy, double dz, AxisAlignedBB collision) {
++        // Swept AABB slab intervals, with open boundaries: touching a block is
++        // allowed, penetrating it at any point during the movement is not.
++        double enter = 0.0D;
++        double exit = 1.0D;
++
++        if (dx == 0.0D) {
++            if (start.d <= collision.a || start.a >= collision.d) return false;
++        } else {
++            double t1 = (collision.a - start.d) / dx;
++            double t2 = (collision.d - start.a) / dx;
++            enter = Math.max(enter, Math.min(t1, t2));
++            exit = Math.min(exit, Math.max(t1, t2));
++        }
++
++        if (dy == 0.0D) {
++            if (start.e <= collision.b || start.b >= collision.e) return false;
++        } else {
++            double t1 = (collision.b - start.e) / dy;
++            double t2 = (collision.e - start.b) / dy;
++            enter = Math.max(enter, Math.min(t1, t2));
++            exit = Math.min(exit, Math.max(t1, t2));
++        }
++
++        if (dz == 0.0D) {
++            if (start.f <= collision.c || start.c >= collision.f) return false;
++        } else {
++            double t1 = (collision.c - start.f) / dz;
++            double t2 = (collision.f - start.c) / dz;
++            enter = Math.max(enter, Math.min(t1, t2));
++            exit = Math.min(exit, Math.max(t1, t2));
++        }
++
++        return enter + 1.0E-9D < exit;
++    }
++}
+diff --git a/src/test/java/com/hpfxd/pandaspigot/util/EmbeddedPlayerCollisionTest.java b/src/test/java/com/hpfxd/pandaspigot/util/EmbeddedPlayerCollisionTest.java
+new file mode 100644
+--- /dev/null
++++ b/src/test/java/com/hpfxd/pandaspigot/util/EmbeddedPlayerCollisionTest.java
+@@ -0,0 +1,95 @@
++package com.hpfxd.pandaspigot.util;
++
++import java.util.Arrays;
++import net.minecraft.server.AxisAlignedBB;
++import org.junit.Test;
++
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++public class EmbeddedPlayerCollisionTest {
++    private static final AxisAlignedBB PLAYER = new AxisAlignedBB(0.2D, 1.0D, 0.2D, 0.8D, 2.8D, 0.8D);
++    private static final AxisAlignedBB ICE = new AxisAlignedBB(0.0D, 1.0D, 0.0D, 1.0D, 3.0D, 1.0D);
++
++    private boolean blocked(double dx, double dy, double dz, AxisAlignedBB... blocks) {
++        return EmbeddedPlayerCollision.isBlocked(PLAYER, dx, dy, dz, Arrays.asList(blocks));
++    }
++
++    @Test
++    public void allowsEscapeFromExistingIce() {
++        assertFalse(blocked(1.2D, 0.0D, 0.0D, ICE));
++        assertFalse(blocked(-1.2D, 0.0D, 0.0D, ICE));
++        assertFalse(blocked(0.0D, 2.0D, 0.0D, ICE));
++        assertFalse(blocked(0.0D, -2.0D, 0.0D, ICE));
++        assertFalse(blocked(0.0D, 0.0D, 1.2D, ICE));
++        assertFalse(blocked(0.0D, 0.0D, -1.2D, ICE));
++    }
++
++    @Test
++    public void blocksEntryAndCompleteCrossingOfAnotherWall() {
++        AxisAlignedBB wall = new AxisAlignedBB(1.0D, 0.0D, -2.0D, 2.0D, 5.0D, 3.0D);
++        assertTrue(blocked(0.3D, 0.0D, 0.0D, ICE, wall));
++        assertTrue(blocked(3.0D, 0.0D, 0.0D, ICE, wall));
++        assertTrue(blocked(3.0D, 0.5D, 0.4D, ICE, wall));
++    }
++
++    @Test
++    public void blocksNegativeDirectionsAndVerticalPhasing() {
++        assertTrue(blocked(-3.0D, 0.0D, 0.0D, ICE, new AxisAlignedBB(-2, 0, -2, -1, 5, 3)));
++        assertTrue(blocked(0.0D, 0.0D, -3.0D, ICE, new AxisAlignedBB(-2, 0, -2, 3, 5, -1)));
++        assertTrue(blocked(0.0D, 0.0D, 3.0D, ICE, new AxisAlignedBB(-2, 0, 1, 3, 5, 2)));
++        assertTrue(blocked(0.0D, 3.0D, 0.0D, ICE, new AxisAlignedBB(-2, 3, -2, 3, 4, 3)));
++        assertTrue(blocked(0.0D, -3.0D, 0.0D, ICE, new AxisAlignedBB(-2, -1, -2, 3, 0, 3)));
++    }
++
++    @Test
++    public void blocksTinyPenetrationAndThinPartialShapes() {
++        assertTrue(blocked(0.20001D, 0.0D, 0.0D, ICE, new AxisAlignedBB(1, 0, -2, 2, 5, 3)));
++        assertTrue(blocked(3.0D, 0.0D, 0.0D, ICE, new AxisAlignedBB(1.5D, 0, -2, 1.5625D, 5, 3)));
++    }
++
++    @Test
++    public void permitsTouchingSlidingAndNoMovement() {
++        AxisAlignedBB wall = new AxisAlignedBB(0.8D, 0, -2, 2, 5, 3);
++        assertFalse(blocked(0.0D, 0.0D, 1.0D, ICE, wall));
++        assertFalse(blocked(0.0D, 0.0D, 0.0D, ICE, wall));
++        assertFalse(blocked(0.2D, 0.0D, 0.0D, ICE, new AxisAlignedBB(1, 0, -2, 2, 5, 3)));
++        assertFalse(blocked(1.0D, 0.0D, 0.0D, ICE, new AxisAlignedBB(-2, 0, -2, 3, 1, 3)));
++    }
++
++    @Test
++    public void allowsVanillaStepUpRoute() {
++        assertFalse(blocked(1.0D, 0.5D, 0.0D, ICE, new AxisAlignedBB(1, 1, 0, 2, 1.5D, 1)));
++    }
++
++    @Test
++    public void checksFullPlayerWidthAndHeight() {
++        assertTrue(blocked(3.0D, 0.0D, 0.0D, ICE, new AxisAlignedBB(1, 0, 0.7D, 2, 5, 1)));
++        assertTrue(blocked(3.0D, 0.0D, 0.0D, ICE, new AxisAlignedBB(1, 2.5D, -2, 2, 3, 3)));
++    }
++
++    @Test
++    public void cannotDeepenAnExistingShallowWallOverlap() {
++        AxisAlignedBB wall = new AxisAlignedBB(0.79D, 0, -2, 2, 5, 3);
++        assertTrue(blocked(0.01D, 0.0D, 0.0D, ICE, wall));
++        assertTrue(blocked(3.0D, 0.0D, 0.0D, ICE, wall));
++        assertFalse(blocked(-1.0D, 0.0D, 0.0D, ICE, wall));
++        assertFalse(blocked(0.0D, 0.0D, 1.0D, ICE, wall));
++    }
++
++    @Test
++    public void partialIceOverlapAllowsRetreatButNotDeeperPenetration() {
++        AxisAlignedBB partialIce = new AxisAlignedBB(0.5D, 1, 0, 1.5D, 3, 1);
++        assertFalse(blocked(-1.0D, 0.0D, 0.0D, partialIce));
++        assertTrue(blocked(0.1D, 0.0D, 0.0D, partialIce));
++        assertTrue(blocked(3.0D, 0.0D, 0.0D, partialIce));
++    }
++
++    @Test
++    public void differentObstaclesCanBlockEachAlternativeRoute() {
++        AxisAlignedBB directObstacle = new AxisAlignedBB(1.0D, 1.0D, -2, 1.1D, 1.4D, 3);
++        AxisAlignedBB axisObstacle = new AxisAlignedBB(-2, 3.0D, -2, 0.9D, 3.1D, 3);
++        assertFalse(blocked(3.0D, 3.0D, 0.0D, ICE, directObstacle));
++        assertTrue(blocked(3.0D, 3.0D, 0.0D, ICE, directObstacle, axisObstacle));
++    }
++}
